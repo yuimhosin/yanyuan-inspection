@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import sys
@@ -154,11 +155,65 @@ def load_known_room_types() -> set[str]:
     return set(merged.keys())
 
 
-def read_sop_excel(path: str | Path) -> list[SopRoomRecord]:
-    """读取 sop.xls，按标准分类聚合检查项。"""
-    df = pd.read_excel(path)
+SOP_TEMPLATE_COLUMNS = ["标准分类", "标准名称", "检查内容", "操作类型"]
+
+SOP_TEMPLATE_EXAMPLE_ROWS = [
+    {
+        "标准分类": "大清谷空调机房巡检",
+        "标准名称": "空调运行与阀门",
+        "检查内容": "供水压力MPa",
+        "操作类型": "判断",
+    },
+    {
+        "标准分类": "大清谷空调机房巡检",
+        "标准名称": "空调运行与阀门",
+        "检查内容": "回水压力MPa",
+        "操作类型": "判断",
+    },
+    {
+        "标准分类": "大清谷空调机房巡检",
+        "标准名称": "空调运行与阀门",
+        "检查内容": "阀门状态",
+        "操作类型": "判断",
+    },
+    {
+        "标准分类": "大清谷强电井巡检",
+        "标准名称": "环境与标识",
+        "检查内容": "环境卫生",
+        "操作类型": "判断",
+    },
+    {
+        "标准分类": "大清谷强电井巡检",
+        "标准名称": "环境与标识",
+        "检查内容": "照明灯",
+        "操作类型": "判断",
+    },
+    {
+        "标准分类": "燕园1号楼B1层1号空调机房巡检",
+        "标准名称": "示例：燕园前缀",
+        "检查内容": "供水温度℃",
+        "操作类型": "判断",
+    },
+]
+
+
+def get_sop_template_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(SOP_TEMPLATE_EXAMPLE_ROWS, columns=SOP_TEMPLATE_COLUMNS)
+
+
+def build_sop_template_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        get_sop_template_dataframe().to_excel(writer, index=False, sheet_name="SOP示例")
+    return buffer.getvalue()
+
+
+def parse_sop_dataframe(df: pd.DataFrame) -> list[SopRoomRecord]:
+    """将 SOP DataFrame 解析为机房记录列表。"""
     if df.shape[1] < 3:
-        raise ValueError("SOP 表列数不足，至少需要：标准分类、标准名称、检查内容")
+        raise ValueError(
+            "SOP 表列数不足，至少需要 4 列：标准分类、标准名称、检查内容、操作类型"
+        )
 
     room_col, content_col = df.columns[0], df.columns[2]
     grouped: dict[str, list[str]] = {}
@@ -181,7 +236,6 @@ def read_sop_excel(path: str | Path) -> list[SopRoomRecord]:
         community, room_name = parse_community_and_room(sop_name)
         if not community:
             continue
-        # 去重且保序
         seen: set[str] = set()
         unique_items: list[str] = []
         for item in items:
@@ -197,6 +251,22 @@ def read_sop_excel(path: str | Path) -> list[SopRoomRecord]:
             )
         )
     return records
+
+
+def read_sop_excel(
+    source: str | Path | bytes | io.BytesIO,
+    *,
+    filename: str | None = None,
+) -> list[SopRoomRecord]:
+    """读取 SOP 表格（路径或上传字节），按标准分类聚合检查项。"""
+    if isinstance(source, (str, Path)):
+        df = pd.read_excel(source)
+    else:
+        buffer = io.BytesIO(source) if isinstance(source, bytes) else source
+        name = (filename or "").lower()
+        engine = "xlrd" if name.endswith(".xls") else None
+        df = pd.read_excel(buffer, engine=engine)
+    return parse_sop_dataframe(df)
 
 
 def _split_env_items(sop_items: list[str]) -> tuple[list[str], list[str]]:
@@ -442,6 +512,64 @@ def import_matches_to_db(
         stats["inserted"] += 1
 
     return stats
+
+
+def sync_sop_from_upload(
+    file_content: bytes,
+    filename: str,
+    community_filter: str | None = None,
+    *,
+    skip_existing: bool = True,
+) -> dict:
+    """上传 SOP 表格并同步到数据库，返回供界面展示的结果摘要。"""
+    try:
+        records = read_sop_excel(file_content, filename=filename)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"表格读取失败：{exc}",
+            "filename": filename,
+        }
+
+    all_count = len(records)
+    if community_filter:
+        records = [r for r in records if r.community == community_filter]
+
+    if not records:
+        prefixes = "、".join(COMMUNITY_PREFIX_MAP.keys())
+        return {
+            "ok": False,
+            "error": (
+                f"未识别到可导入机房。请确认「标准分类」含社区前缀（{prefixes}），"
+                f"且与所选社区一致。"
+            ),
+            "filename": filename,
+            "total_sop_rooms": all_count,
+        }
+
+    matched, skipped = match_sop_records(records)
+    import_stats = import_matches_to_db(matched, skip_existing=skip_existing)
+
+    return {
+        "ok": True,
+        "filename": filename,
+        "total_sop_rooms": len(records),
+        "matched": len(matched),
+        "skipped": len(skipped),
+        "import": import_stats,
+        "matched_rooms": [
+            {
+                "社区": m.community,
+                "机房名称": m.room_name,
+                "机房类型": m.room_type,
+                "设备": [d["设备类型"] for d in m.devices],
+            }
+            for m in matched
+        ],
+        "skipped_rooms": [
+            {"sop": s.sop_name, "原因": s.skipped_reason} for s in skipped
+        ],
+    }
 
 
 def run_import(

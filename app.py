@@ -46,6 +46,13 @@ from data_loader import (
 
 )
 
+from sop_matcher import (
+    COMMUNITY_PREFIX_MAP,
+    build_sop_template_bytes,
+    get_sop_template_dataframe,
+    sync_sop_from_upload,
+)
+
 from database import (
     clear_rooms,
     delete_room,
@@ -109,6 +116,72 @@ st.markdown(
     }
 
     .check-title { color: #374151; font-size: 0.9rem; margin: 8px 0 4px; }
+
+    .sop-hint-box {
+
+        background: #fffbeb;
+
+        border: 1px solid #fcd34d;
+
+        border-radius: 10px;
+
+        padding: 12px 14px;
+
+        margin: 8px 0 12px;
+
+    }
+
+    .sop-hint-title { font-weight: 700; color: #92400e; margin-bottom: 6px; }
+
+    .sop-hint-text { color: #78350f; font-size: 0.9rem; line-height: 1.55; }
+
+    .sop-table-wrap {
+
+        border: 1px solid #dbe3ef;
+
+        border-radius: 8px;
+
+        overflow: hidden;
+
+        margin-top: 8px;
+
+    }
+
+    .sop-table-wrap table {
+
+        width: 100%;
+
+        border-collapse: collapse;
+
+        font-size: 0.86rem;
+
+    }
+
+    .sop-table-wrap th {
+
+        background: #eff6ff;
+
+        color: #1e3a8a;
+
+        text-align: left;
+
+        padding: 8px 10px;
+
+        border-bottom: 1px solid #dbe3ef;
+
+    }
+
+    .sop-table-wrap td {
+
+        padding: 7px 10px;
+
+        border-bottom: 1px solid #eef2f7;
+
+        color: #334155;
+
+    }
+
+    .sop-table-wrap tr:last-child td { border-bottom: none; }
 
     </style>
 
@@ -337,6 +410,198 @@ def _to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 
+def _render_sop_template_hint() -> None:
+
+    prefixes = "、".join(f"「{p}」" for p in COMMUNITY_PREFIX_MAP)
+
+    example_html = get_sop_template_dataframe().to_html(index=False, border=0, escape=False)
+
+    st.markdown(
+
+        f"""
+
+        <div class="sop-hint-box">
+
+            <div class="sop-hint-title">SOP 表格格式说明</div>
+
+            <div class="sop-hint-text">
+
+                上传 .xls / .xlsx，系统会自动匹配机房与设备并写入当前社区数据库。<br>
+
+                · 第 1 列 <b>标准分类</b>：须含社区前缀（{prefixes}）+ 机房名 + 「巡检」<br>
+
+                · 第 2 列 <b>标准名称</b>：检查项分组说明（可留空）<br>
+
+                · 第 3 列 <b>检查内容</b>：具体巡检参数或环境项<br>
+
+                · 第 4 列 <b>操作类型</b>：一般为「判断」<br>
+
+                · 同一机房占多行；无法匹配的机房/设备会自动跳过
+
+            </div>
+
+            <div class="sop-table-wrap">{example_html}</div>
+
+        </div>
+
+        """,
+
+        unsafe_allow_html=True,
+
+    )
+
+
+
+
+
+def _render_sop_upload_sync(community: str) -> None:
+
+    with st.expander("📤 SOP 表格上传与自动同步", expanded=False):
+
+        _render_sop_template_hint()
+
+        dl_col, up_col = st.columns([1, 2])
+
+        with dl_col:
+
+            st.download_button(
+
+                "下载示例模板 (.xlsx)",
+
+                data=build_sop_template_bytes(),
+
+                file_name="SOP表格示例.xlsx",
+
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+                use_container_width=True,
+
+            )
+
+            st.caption("可按此格式填写后上传。")
+
+        with up_col:
+
+            only_current = st.checkbox(
+
+                f"仅同步当前社区「{community}」",
+
+                value=True,
+
+                help="关闭后将导入表格中所有已识别社区的数据",
+
+            )
+
+            uploaded = st.file_uploader(
+
+                "选择 SOP 表格",
+
+                type=["xls", "xlsx"],
+
+                key="sop_file_uploader",
+
+                help="上传后立即自动匹配并写入数据库",
+
+            )
+
+        if not uploaded:
+
+            return
+
+        file_key = f"{uploaded.name}:{uploaded.size}"
+
+        if st.session_state.get("_last_sop_sync_key") == file_key:
+
+            if summary := st.session_state.get("_last_sop_sync_summary"):
+
+                st.info(summary)
+
+            return
+
+        with st.spinner("正在匹配并同步…"):
+
+            result = sync_sop_from_upload(
+
+                uploaded.getvalue(),
+
+                uploaded.name,
+
+                community_filter=community if only_current else None,
+
+            )
+
+        st.session_state._last_sop_sync_key = file_key
+
+        if not result.get("ok"):
+
+            st.error(result.get("error", "同步失败"))
+
+            st.session_state._last_sop_sync_summary = None
+
+            return
+
+        imp = result["import"]
+
+        summary = (
+
+            f"「{uploaded.name}」同步完成：匹配 {result['matched']} 个机房，"
+
+            f"新增 {imp['inserted']} 条，已存在跳过 {imp['skipped_existing']} 条，"
+
+            f"设备 {imp['devices_saved']} 个；未匹配 {result['skipped']} 条已忽略。"
+
+        )
+
+        st.session_state._last_sop_sync_summary = summary
+
+        st.success(summary)
+
+        if result["matched_rooms"]:
+
+            preview = pd.DataFrame(
+
+                [
+
+                    {
+
+                        "社区": r["社区"],
+
+                        "机房名称": r["机房名称"],
+
+                        "机房类型": r["机房类型"],
+
+                        "设备": "、".join(r["设备"]) if r["设备"] else f"仅{ENV_INSPECTION_LABEL}",
+
+                    }
+
+                    for r in result["matched_rooms"][:20]
+
+                ]
+
+            )
+
+            st.dataframe(preview, use_container_width=True, hide_index=True)
+
+            if len(result["matched_rooms"]) > 20:
+
+                st.caption(f"仅展示前 20 条，共 {len(result['matched_rooms'])} 条。")
+
+        if result["skipped_rooms"]:
+
+            with st.expander(f"未匹配项（{len(result['skipped_rooms'])}）", expanded=False):
+
+                for row in result["skipped_rooms"]:
+
+                    st.caption(f"{row['sop']} — {row['原因']}")
+
+        _reload_entries_for_community(community)
+
+        st.rerun()
+
+
+
+
+
 def main() -> None:
 
     _init_state()
@@ -380,6 +645,10 @@ def main() -> None:
     if st.session_state._prev_community != community:
 
         _reload_entries_for_community(community)
+
+
+
+    _render_sop_upload_sync(community)
 
 
 

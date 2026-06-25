@@ -1,405 +1,828 @@
 # -*- coding: utf-8 -*-
-"""燕园巡检上报表 — Streamlit"""
+
+"""巡检上报表 — Streamlit"""
+
 from pathlib import Path
 
+
+
 import pandas as pd
+
 import streamlit as st
 
+
+
 from data_loader import (
+
     ENV_INSPECTION_ITEMS,
+
     ENV_INSPECTION_LABEL,
-    EXCEL_PATH,
+
     apply_device_category_rules,
-    build_mappings,
+
     build_summary_rows,
+
     ensure_device_check_items,
+
     ensure_env_check_items,
+
     get_check_items,
+
+    get_community_categories,
+
     get_valid_device_categories,
+
     is_valid_device_for_room,
-    load_inspection_data,
+
     load_inspection_items,
+
+    load_master_mappings,
+
     merge_manual_room_types,
+
+    resolve_excel_path,
+
     resolve_room_meta,
+
 )
 
-st.set_page_config(page_title="燕园巡检上报", page_icon="📋", layout="wide")
+from database import (
+    clear_rooms,
+    delete_room,
+    get_db_info,
+    init_db,
+    insert_room,
+    load_entries,
+    room_exists,
+    save_devices,
+)
+
+
+
+st.set_page_config(page_title="巡检上报", page_icon="📋", layout="wide")
+
+
 
 st.markdown(
+
     """
+
     <style>
+
     .report-card {
+
         background: #f8fafc;
+
         border: 1px solid #dbe3ef;
+
         border-radius: 10px;
+
         padding: 14px 16px;
+
         margin-bottom: 12px;
+
     }
+
     .report-title { font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+
     .report-sub { color: #64748b; font-size: 0.9rem; }
+
     .check-tag {
+
         display: inline-block;
+
         background: #ecfdf5;
+
         color: #047857;
+
         border-radius: 6px;
+
         padding: 3px 10px;
+
         margin: 2px 6px 2px 0;
+
         font-size: 0.84rem;
+
         border: 1px solid #a7f3d0;
+
     }
+
     .check-title { color: #374151; font-size: 0.9rem; margin: 8px 0 4px; }
+
     </style>
+
     """,
+
     unsafe_allow_html=True,
+
 )
+
+
+
 
 
 def _init_state() -> None:
+
+    init_db()
+
     if "report_entries" not in st.session_state:
+
         st.session_state.report_entries = []
+
     if "active_room_idx" not in st.session_state:
+
         st.session_state.active_room_idx = 0
+
     if "reset_room_form" not in st.session_state:
+
         st.session_state.reset_room_form = False
-    if "pending_quick_fill" not in st.session_state:
-        st.session_state.pending_quick_fill = None
+
     if "focus_latest_room" not in st.session_state:
+
         st.session_state.focus_latest_room = False
+
+    if "_prev_community" not in st.session_state:
+
+        st.session_state._prev_community = None
+
+
+
+
+
+def _reload_entries_for_community(community: str) -> None:
+
+    st.session_state.report_entries = load_entries(community)
+
+    st.session_state._prev_community = community
+
+    st.session_state.active_room_idx = 0
+
+
+
 
 
 def _sync_active_room_select(entry_count: int) -> None:
+
     """在 selectbox 渲染前同步选中项，确保新添加机房后自动切到最新一条。"""
+
     if entry_count <= 0:
+
         return
+
+
 
     latest = entry_count - 1
+
     if st.session_state.focus_latest_room:
+
         st.session_state.active_room_select = latest
+
         st.session_state.active_room_idx = latest
+
         st.session_state.focus_latest_room = False
+
         return
 
+
+
     current = st.session_state.get("active_room_select", 0)
+
     if current >= entry_count:
+
         st.session_state.active_room_select = latest
+
         st.session_state.active_room_idx = latest
+
+
+
 
 
 def _apply_form_pending_actions() -> None:
+
     """在控件渲染前处理表单状态，避免 widget 实例化后修改 session_state 报错。"""
+
     if st.session_state.reset_room_form:
+
         st.session_state.room_name_input = ""
+
         st.session_state.reset_room_form = False
 
-    pending = st.session_state.pending_quick_fill
-    if pending:
-        name, room_type = pending
-        st.session_state.room_name_input = name
-        st.session_state.room_type_input = room_type
-        st.session_state.pending_quick_fill = None
+
+
 
 
 @st.cache_data(show_spinner="正在加载基础数据…")
-def _load_master_data(excel_path: str):
-    rooms = load_inspection_data(excel_path)
-    room_name_to_type, type_to_categories, room_catalog = build_mappings(rooms)
+
+def _load_master_data(excel_path: str | None):
+
+    _, type_to_categories, room_catalog = load_master_mappings(excel_path)
+
     inspection_items = load_inspection_items()
+
     type_to_categories = merge_manual_room_types(type_to_categories)
+
     type_to_categories = apply_device_category_rules(type_to_categories, inspection_items)
-    room_names = sorted(room_catalog.keys())
-    return room_name_to_type, type_to_categories, room_catalog, room_names, inspection_items
+
+    return type_to_categories, room_catalog, inspection_items
+
+
+
 
 
 def _find_entry_index(room_name: str) -> int | None:
+
     for i, entry in enumerate(st.session_state.report_entries):
+
         if entry["机房名称"] == room_name:
+
             return i
+
     return None
 
 
+
+
+
+def _persist_devices(entry: dict) -> None:
+
+    if entry.get("id"):
+
+        save_devices(entry["id"], entry.get("devices") or [])
+
+
+
+
+
 def _render_check_items(items: list[str], title: str = "需巡检项目") -> None:
+
     if not items:
+
         st.caption("暂无对应作业指导书检查项目。")
+
         return
+
     tags = "".join(f'<span class="check-tag">{item}</span>' for item in items)
+
     st.markdown(
+
         f'<div class="check-title">{title}（{len(items)} 项）</div>{tags}',
+
         unsafe_allow_html=True,
+
     )
+
+
+
 
 
 def _render_summary_table(inspection_items: dict[str, list[str]]) -> None:
+
     rows = build_summary_rows(st.session_state.report_entries, inspection_items)
+
     if rows:
+
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
     else:
+
         st.info("暂无上报记录，请先添加机房与设备。")
 
 
+
+
+
 def _export_dataframe(export_rows: list[dict]) -> pd.DataFrame:
+
     if not export_rows:
+
         return pd.DataFrame()
 
-    preferred = ["机房名称", "机房类型", "设备类型", "数量"]
+
+
+    preferred = ["社区分类", "机房名称", "机房类型", "设备类型", "数量"]
+
     check_cols = sorted(
+
         [c for c in export_rows[0] if c.startswith("需巡检项目")],
+
         key=lambda x: int(x.replace("需巡检项目", "") or 0),
+
     )
+
     columns = preferred + check_cols
+
     return pd.DataFrame(export_rows).reindex(columns=columns)
 
 
+
+
+
 def _to_excel_bytes(df: pd.DataFrame) -> bytes:
+
     from io import BytesIO
 
+
+
     buffer = BytesIO()
+
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+
         df.to_excel(writer, index=False, sheet_name="巡检上报")
+
     return buffer.getvalue()
 
 
+
+
+
 def main() -> None:
+
     _init_state()
 
-    excel_path = str(Path(__file__).resolve().parent.parent / "燕园巡检.xlsx")
-    if not Path(excel_path).exists():
-        excel_path = str(EXCEL_PATH)
 
-    room_name_to_type, type_to_categories, room_catalog, room_names, inspection_items = _load_master_data(excel_path)
 
-    st.title("燕园巡检上报表")
-    st.caption("自定义机房名称、自行选择机房类型；设备选项按所选机房类型严格匹配。")
+    excel_path = resolve_excel_path()
+    excel_path_str = str(excel_path) if excel_path else None
+
+    type_to_categories, room_catalog, inspection_items = _load_master_data(excel_path_str)
+
+
+
+    db_info = get_db_info()
+
+    st.title("巡检上报表")
+
+    st.caption(
+        f"按社区管理机房；任意机房类型均可添加全部设备类型。"
+        f" 数据存储：{db_info['label']}。"
+    )
+
+
+
+    community_options = get_community_categories()
+
+    community = st.selectbox(
+
+        "社区分类",
+
+        options=community_options,
+
+        key="community_select",
+
+        help="选择所属养老社区（园区简称），决定数据库存储分区",
+
+    )
+
+
+
+    if st.session_state._prev_community != community:
+
+        _reload_entries_for_community(community)
+
+
 
     room_types = sorted(type_to_categories.keys())
 
+
+
     # ── 第一步：录入机房 ──
+
     st.subheader("1. 录入机房")
+
+
 
     _apply_form_pending_actions()
 
-    with st.expander("从已有机房快速填充（可选）", expanded=False):
-        quick_pick = st.selectbox(
-            "选择参考机房",
-            options=[""] + room_names,
-            format_func=lambda x: "不使用，手动填写" if x == "" else x,
-            key="quick_fill_room",
-        )
-        if st.button("填入名称与类型", key="apply_quick_fill"):
-            if quick_pick and quick_pick in room_catalog:
-                st.session_state.pending_quick_fill = (
-                    quick_pick,
-                    room_catalog[quick_pick]["机房类型"],
-                )
-                st.rerun()
+
 
     col_name, col_type, col_btn = st.columns([3, 2, 1])
+
     with col_name:
+
         room_name = st.text_input(
+
             "机房名称",
+
             placeholder="可自定义输入，如：5号楼B1层新配电室",
+
             key="room_name_input",
+
         )
+
     with col_type:
+
         room_type = st.selectbox(
+
             "机房类型",
+
             options=room_types,
+
             key="room_type_input",
-            help="自行选择；决定下方可选的设备类型",
+
+            help="自行选择；决定环境巡检与汇总分类",
+
         )
+
     with col_btn:
+
         st.write("")
+
         st.write("")
+
         add_room = st.button("添加机房", type="primary", use_container_width=True)
 
+
+
     if room_name in room_catalog:
+
         suggested = room_catalog[room_name]["机房类型"]
+
         if suggested != room_type:
+
             st.caption(f"提示：基础数据中「{room_name}」的类型为「{suggested}」，当前已选手动类型「{room_type}」。")
+
         else:
-            st.caption(f"已匹配基础数据，将自动带入该机房的其他基础信息。")
+
+            st.caption("已匹配基础数据，将自动带入该机房的其他基础信息。")
+
+
 
     if add_room:
+
         room_name = room_name.strip()
+
         if not room_name:
+
             st.warning("请填写机房名称。")
+
         elif not room_type:
+
             st.warning("请选择机房类型。")
-        elif _find_entry_index(room_name) is not None:
-            st.warning(f"「{room_name}」已在本次上报中，请勿重复添加。")
+
+        elif _find_entry_index(room_name) is not None or room_exists(community, room_name):
+
+            st.warning(f"「{community}」下「{room_name}」已存在，请勿重复添加。")
+
         else:
+
             meta = resolve_room_meta(room_name, room_type, room_catalog)
-            st.session_state.report_entries.append(
-                {
-                    "机房名称": room_name,
-                    "机房类型": room_type,
-                    "meta": meta,
-                    "devices": [],
-                    "env_check_items": list(ENV_INSPECTION_ITEMS),
-                    "custom": room_name not in room_catalog,
-                }
-            )
+
+            entry = {
+
+                "社区分类": community,
+
+                "机房名称": room_name,
+
+                "机房类型": room_type,
+
+                "meta": meta,
+
+                "devices": [],
+
+                "env_check_items": list(ENV_INSPECTION_ITEMS),
+
+                "custom": room_name not in room_catalog,
+
+            }
+
+            entry["id"] = insert_room(entry)
+
+            st.session_state.report_entries.append(entry)
+
             st.session_state.focus_latest_room = True
+
             st.session_state.reset_room_form = True
-            st.success(f"已添加：{room_name}（{room_type}）")
+
+            st.success(f"已添加并保存：{community} · {room_name}（{room_type}）")
+
             st.rerun()
+
+
 
     if not st.session_state.report_entries:
+
         st.divider()
+
         st.subheader("上报汇总")
+
         _render_summary_table(inspection_items)
+
         return
 
+
+
     st.divider()
+
+
 
     # ── 第二步：为已添加机房录入设备 ──
+
     st.subheader("2. 添加设备类型与数量")
 
+
+
     room_labels = [
+
         f"{e['机房名称']}（{e['机房类型']}）" for e in st.session_state.report_entries
+
     ]
+
     _sync_active_room_select(len(room_labels))
+
     active_idx = st.selectbox(
+
         "当前操作的机房",
+
         range(len(room_labels)),
+
         format_func=lambda i: room_labels[i],
+
         key="active_room_select",
+
     )
+
     st.session_state.active_room_idx = active_idx
+
     entry = st.session_state.report_entries[active_idx]
+
     room_type = entry["机房类型"]
 
+
+
     st.markdown(
+
         f'<div class="report-card"><div class="report-title">{entry["机房名称"]}</div>'
-        f'<div class="report-sub">机房类型：{room_type}</div></div>',
+
+        f'<div class="report-sub">社区分类：{entry.get("社区分类", community)} · 机房类型：{room_type}</div></div>',
+
         unsafe_allow_html=True,
+
     )
+
     if entry.get("custom"):
-        st.caption("自定义机房：按所选机房类型匹配设备。")
+
+        st.caption("自定义机房。")
+
+
 
     st.markdown(f"**{ENV_INSPECTION_LABEL}（必检）**")
+
     _render_check_items(ensure_env_check_items(entry), title=ENV_INSPECTION_LABEL)
 
-    st.markdown("**设备巡检**")
-    valid_categories = get_valid_device_categories(room_type, type_to_categories)
-    if not valid_categories:
-        st.warning(f"基础数据中「{room_type}」暂无可用设备类型。")
-    else:
-        dcol1, dcol2, dcol3 = st.columns([3, 1, 1])
-        with dcol1:
-            device_category = st.selectbox(
-                "设备类型",
-                options=[""] + valid_categories,
-                format_func=lambda x: "请选择设备类型" if x == "" else x,
-                key=f"device_cat_{active_idx}",
-                help=f"仅显示「{room_type}」允许的设备类型",
-            )
-            if device_category:
-                preview_items = get_check_items(device_category, inspection_items)
-                _render_check_items(preview_items)
-        with dcol2:
-            quantity = st.number_input(
-                "数量",
-                min_value=1,
-                max_value=999,
-                value=1,
-                step=1,
-                key=f"device_qty_{active_idx}",
-            )
-        with dcol3:
-            st.write("")
-            st.write("")
-            add_device = st.button("添加设备", use_container_width=True)
 
-        if add_device:
-            if not device_category:
-                st.warning("请选择设备类型。")
-            elif not is_valid_device_for_room(room_type, device_category, type_to_categories):
-                st.error(f"「{device_category}」不属于「{room_type}」，无法添加。")
+
+    st.markdown("**设备巡检**")
+
+    valid_categories = get_valid_device_categories(room_type, type_to_categories, inspection_items)
+
+    dcol1, dcol2, dcol3 = st.columns([3, 1, 1])
+
+    with dcol1:
+
+        device_category = st.selectbox(
+
+            "设备类型",
+
+            options=[""] + valid_categories,
+
+            format_func=lambda x: "请选择设备类型" if x == "" else x,
+
+            key=f"device_cat_{active_idx}",
+
+            help="可选全部已配置检查项目的设备类型",
+
+        )
+
+        if device_category:
+
+            preview_items = get_check_items(device_category, inspection_items)
+
+            _render_check_items(preview_items)
+
+    with dcol2:
+
+        quantity = st.number_input(
+
+            "数量",
+
+            min_value=1,
+
+            max_value=999,
+
+            value=1,
+
+            step=1,
+
+            key=f"device_qty_{active_idx}",
+
+        )
+
+    with dcol3:
+
+        st.write("")
+
+        st.write("")
+
+        add_device = st.button("添加设备", use_container_width=True)
+
+
+
+    if add_device:
+
+        if not device_category:
+
+            st.warning("请选择设备类型。")
+
+        elif not is_valid_device_for_room(
+            room_type, device_category, type_to_categories, inspection_items
+        ):
+
+            st.error(f"「{device_category}」不是有效设备类型。")
+
+        else:
+
+            existing = next(
+
+                (d for d in entry["devices"] if d["设备类型"] == device_category),
+
+                None,
+
+            )
+
+            if existing:
+
+                existing["数量"] += int(quantity)
+
+                st.success(f"已累加 {device_category} 数量 +{quantity}")
+
             else:
-                existing = next(
-                    (d for d in entry["devices"] if d["设备类型"] == device_category),
-                    None,
+
+                entry["devices"].append(
+
+                    {
+
+                        "设备类型": device_category,
+
+                        "数量": int(quantity),
+
+                        "check_items": get_check_items(device_category, inspection_items),
+
+                    }
+
                 )
-                if existing:
-                    existing["数量"] += int(quantity)
-                    st.success(f"已累加 {device_category} 数量 +{quantity}")
-                else:
-                    entry["devices"].append(
-                        {
-                            "设备类型": device_category,
-                            "数量": int(quantity),
-                            "check_items": get_check_items(device_category, inspection_items),
-                        }
-                    )
-                    st.success(f"已添加 {device_category} × {quantity}")
-                st.rerun()
+
+                st.success(f"已添加 {device_category} × {quantity}")
+
+            _persist_devices(entry)
+
+            st.rerun()
+
+
 
     # 当前机房已添加的设备
+
     if entry["devices"]:
+
         st.markdown("**本机房已添加设备**")
+
         for device in entry["devices"]:
+
             items = ensure_device_check_items(device, inspection_items)
+
             st.markdown(f"**{device['设备类型']}** × {device['数量']}")
+
             _render_check_items(items)
 
+
+
         if st.button("清空本机房设备", key=f"clear_devices_{active_idx}"):
+
             entry["devices"] = []
+
+            _persist_devices(entry)
+
             st.rerun()
 
+
+
     st.divider()
+
+
 
     # ── 已添加机房列表 & 汇总 ──
+
     st.subheader("3. 本次上报汇总")
 
+
+
     action_cols = st.columns([1, 1, 4])
+
     with action_cols[0]:
+
         if st.button("删除当前机房", type="secondary"):
+
+            if entry.get("id"):
+
+                delete_room(entry["id"])
+
             st.session_state.report_entries.pop(active_idx)
+
             st.session_state.active_room_idx = max(0, active_idx - 1)
+
             st.rerun()
+
     with action_cols[1]:
-        if st.button("清空全部上报"):
+
+        if st.button("清空本社区上报"):
+
+            clear_rooms(community)
+
             st.session_state.report_entries = []
+
             st.rerun()
+
+
 
     for i, e in enumerate(st.session_state.report_entries):
+
         env_text = f"{ENV_INSPECTION_LABEL}（必检）"
+
         device_text = (
+
             "、".join(f"{d['设备类型']}×{d['数量']}" for d in e["devices"])
+
             if e["devices"]
+
             else "（未添加设备）"
+
         )
+
         st.markdown(
-            f"**{i + 1}. {e['机房名称']}** · {e['机房类型']}  \n"
+
+            f"**{i + 1}. {e['机房名称']}** · {e.get('社区分类', community)} · {e['机房类型']}  \n"
+
             f"环境：{env_text}  \n"
+
             f"设备：{device_text}"
+
         )
+
+
 
     st.divider()
+
     _render_summary_table(inspection_items)
 
+
+
     export_rows = build_summary_rows(st.session_state.report_entries, inspection_items)
+
     if export_rows:
+
         export_df = _export_dataframe(export_rows)
+
         col_csv, col_xlsx = st.columns(2)
+
         with col_csv:
+
             csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+
             st.download_button(
+
                 "导出 CSV",
+
                 data=csv_bytes,
-                file_name="燕园巡检上报.csv",
+
+                file_name=f"巡检上报_{community}.csv",
+
                 mime="text/csv",
+
                 use_container_width=True,
+
             )
+
         with col_xlsx:
+
             st.download_button(
+
                 "导出 Excel",
+
                 data=_to_excel_bytes(export_df),
-                file_name="燕园巡检上报.xlsx",
+
+                file_name=f"巡检上报_{community}.xlsx",
+
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
                 use_container_width=True,
+
             )
+
+
+
 
 
 if __name__ == "__main__":
+
     main()
+
+

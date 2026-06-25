@@ -1,6 +1,6 @@
 __pycache__/
 *.py[cod]
-.streamlit/
+.streamlit/secrets.toml
 .env
 *.db
 .DS_Store

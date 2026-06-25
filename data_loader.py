@@ -16,11 +16,24 @@ META_FIELDS = [
 ]
 # 仅用于读取燕园巡检.xlsx，不在界面与导出中展示
 
-EXCEL_PATH = Path(__file__).resolve().parent.parent / "燕园巡检.xlsx"
-INSPECTION_ITEMS_PATH = Path(__file__).resolve().parent / "inspection_items.json"
+_BASE_DIR = Path(__file__).resolve().parent
+EXCEL_CANDIDATES = (
+    _BASE_DIR / "燕园巡检.xlsx",
+    _BASE_DIR.parent / "燕园巡检.xlsx",
+)
+EXCEL_PATH = EXCEL_CANDIDATES[-1]
+MAPPING_PATH = _BASE_DIR / "mapping.json"
+INSPECTION_ITEMS_PATH = _BASE_DIR / "inspection_items.json"
 
 ENV_INSPECTION_ITEMS = ["灯光", "温度", "湿度", "标识", "安全隐患", "卫生"]
 ENV_INSPECTION_LABEL = "环境巡检"
+
+# 泰康之家各社区（园区简称）
+DEFAULT_COMMUNITY_CATEGORIES = [
+    "燕", "申", "粤", "蜀", "吴", "楚", "谷", "赣", "沈", "湘",
+    "鹭", "桂", "苏", "甬", "豫", "渝", "徽", "鹏", "琴", "瓯",
+    "福", "儒", "津", "滇",
+]
 
 # 检查项中与空间/环境巡检重复、不应出现在设备行里的条目
 ENV_LIKE_DEVICE_ITEMS = {
@@ -72,7 +85,17 @@ MANUAL_ROOM_DEVICE_MAP: dict[str, list[str]] = {
         "水箱补水系统",
     ],
     "强电竖井": ["配电柜"],
+    "弱电井": [
+        "手机设备",
+        "消防设备",
+        "监控设备",
+        "远传计量设备",
+        "无线对讲设备",
+        "拉绳报警设备",
+        "综合布线柜",
+    ],
     "集水井": ["集水坑", "潜污泵", "配电箱", "单向阀"],
+    "风机房": [],
 }
 
 _ZONE_SUPPLY_ITEMS = {
@@ -124,13 +147,29 @@ def _infer_room_type(room_name: str, raw_type: str) -> str:
         return "柴发机房"
     if "泳池" in room_name:
         return "泳池机房"
+    if "弱电" in room_name and "井" in room_name:
+        return "弱电井"
     if "竖井" in room_name:
         return "强电竖井"
     if "集水井" in room_name or "集水坑" in room_name:
         return "集水井"
     if "给水" in room_name or "水泵" in room_name:
         return "给水机房"
+    if "风机" in room_name:
+        return "风机房"
     return ""
+
+
+def resolve_excel_path(explicit: str | Path | None = None) -> Path | None:
+    """返回第一个存在的 Excel 路径；均不存在则返回 None。"""
+    if explicit:
+        candidate = Path(explicit)
+        if candidate.exists():
+            return candidate
+    for candidate in EXCEL_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def load_inspection_data(path: str | Path = EXCEL_PATH) -> list[dict]:
@@ -248,11 +287,36 @@ def apply_device_category_rules(
     return result
 
 
-def get_valid_device_categories(room_type: str, type_to_categories: dict[str, list[str]]) -> list[str]:
+def get_all_device_categories(items_map: dict[str, list[str]]) -> list[str]:
+    """返回全部可选设备类型（与机房类型无关）。"""
+    kept: list[str] = []
+    for cat in sorted(items_map.keys()):
+        if _is_spatial_duplicate_category(cat, items_map):
+            continue
+        display_cat = resolve_device_category(cat)
+        if display_cat not in kept:
+            kept.append(display_cat)
+    return sorted(kept)
+
+
+def get_valid_device_categories(
+    room_type: str,
+    type_to_categories: dict[str, list[str]],
+    items_map: dict[str, list[str]] | None = None,
+) -> list[str]:
+    if items_map is not None:
+        return get_all_device_categories(items_map)
     return list(type_to_categories.get(room_type, []))
 
 
-def is_valid_device_for_room(room_type: str, device_category: str, type_to_categories: dict[str, list[str]]) -> bool:
+def is_valid_device_for_room(
+    room_type: str,
+    device_category: str,
+    type_to_categories: dict[str, list[str]],
+    items_map: dict[str, list[str]] | None = None,
+) -> bool:
+    if items_map is not None:
+        return device_category in get_all_device_categories(items_map)
     return device_category in type_to_categories.get(room_type, [])
 
 
@@ -266,6 +330,55 @@ def format_meta_value(value) -> str:
 
 def build_empty_meta(room_type: str) -> dict:
     return {field: None for field in META_FIELDS} | {"机房类型": room_type}
+
+
+def load_mappings_from_json(path: str | Path = MAPPING_PATH) -> tuple[dict[str, str], dict[str, list[str]], dict[str, dict]]:
+    """从 mapping.json 加载机房目录与类型-设备映射（Streamlit Cloud 等无 Excel 时使用）。"""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    room_name_to_type: dict[str, str] = {}
+    room_catalog: dict[str, dict] = {}
+    for name, room_type in data.get("room_name_to_type", {}).items():
+        room_type = _normalize_room_type(room_type)
+        room_type = _infer_room_type(name, room_type)
+        if not room_type:
+            continue
+        room_name_to_type[name] = room_type
+        room_catalog[name] = {
+            "机房名称": name,
+            "机房类型": room_type,
+            "meta": build_empty_meta(room_type),
+        }
+
+    type_to_categories = {
+        room_type: list(categories)
+        for room_type, categories in data.get("type_to_categories", {}).items()
+        if room_type and str(room_type).lower() != "nan"
+    }
+    return room_name_to_type, type_to_categories, room_catalog
+
+
+def load_master_mappings(excel_path: str | Path | None = None) -> tuple[dict[str, str], dict[str, list[str]], dict[str, dict]]:
+    """优先从 Excel 加载；文件不存在则回退到 mapping.json。"""
+    resolved = resolve_excel_path(excel_path)
+    if resolved is not None:
+        rooms = load_inspection_data(resolved)
+        return build_mappings(rooms)
+    return load_mappings_from_json()
+
+
+def get_community_categories(
+    room_catalog: dict[str, dict] | None = None,
+    extra: list[str] | None = None,
+) -> list[str]:
+    """返回可选社区列表（园区简称）。"""
+    categories = list(DEFAULT_COMMUNITY_CATEGORIES)
+    if extra:
+        for name in extra:
+            if name and name not in categories:
+                categories.append(name)
+    return categories
 
 
 def resolve_room_meta(
@@ -326,6 +439,7 @@ def build_summary_rows(
         max_check_cols = max(max_check_cols, len(env_items))
         rows.append(
             {
+                "社区分类": entry.get("社区分类", ""),
                 "机房名称": entry["机房名称"],
                 "机房类型": entry["机房类型"],
                 "设备类型": ENV_INSPECTION_LABEL,
@@ -344,6 +458,7 @@ def build_summary_rows(
             max_check_cols = max(max_check_cols, len(check_items))
             rows.append(
                 {
+                    "社区分类": entry.get("社区分类", ""),
                     "机房名称": entry["机房名称"],
                     "机房类型": entry["机房类型"],
                     "设备类型": device["设备类型"],
@@ -355,6 +470,7 @@ def build_summary_rows(
     output: list[dict] = []
     for row in rows:
         flat = {
+            "社区分类": row["社区分类"],
             "机房名称": row["机房名称"],
             "机房类型": row["机房类型"],
             "设备类型": row["设备类型"],

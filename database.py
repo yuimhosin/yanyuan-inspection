@@ -13,6 +13,12 @@ import libsql_client
 from data_loader import ENV_INSPECTION_ITEMS
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "yanyuan_inspection.db"
+SEEDS_DIR = Path(__file__).resolve().parent / "seeds"
+
+# 社区简称 → 种子数据文件（首次启动且该社区无数据时自动导入）
+COMMUNITY_SEED_FILES: dict[str, str] = {
+    "谷": "gu_rooms.json",
+}
 
 
 def _load_secrets_into_env() -> None:
@@ -253,3 +259,48 @@ def room_exists(community_category: str, room_name: str) -> bool:
             [community_category, room_name],
         )
     return bool(result.rows)
+
+
+def count_rooms(community_category: str) -> int:
+    init_db()
+    with _connect() as conn:
+        result = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM rooms WHERE community_category = ?",
+            [community_category],
+        )
+    rows = _rows_to_dicts(result)
+    return int(rows[0]["cnt"]) if rows else 0
+
+
+def seed_community_if_empty(community_category: str) -> int:
+    """若社区尚无数据，则从 seeds/ 导入预置机房。返回新增条数。"""
+    seed_file = COMMUNITY_SEED_FILES.get(community_category)
+    if not seed_file or count_rooms(community_category) > 0:
+        return 0
+
+    path = SEEDS_DIR / seed_file
+    if not path.exists():
+        return 0
+
+    with open(path, encoding="utf-8") as f:
+        entries = json.load(f)
+
+    inserted = 0
+    for entry in entries:
+        if room_exists(community_category, entry["机房名称"]):
+            continue
+        entry = {**entry, "社区分类": community_category}
+        room_id = insert_room(entry)
+        devices = entry.get("devices") or []
+        if devices:
+            save_devices(room_id, devices)
+        inserted += 1
+    return inserted
+
+
+def seed_all_communities_if_empty() -> dict[str, int]:
+    """为所有配置了种子文件的社区执行空库导入。"""
+    return {
+        community: seed_community_if_empty(community)
+        for community in COMMUNITY_SEED_FILES
+    }

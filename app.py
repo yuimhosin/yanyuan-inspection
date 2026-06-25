@@ -55,6 +55,7 @@ from database import (
     load_entries,
     room_exists,
     save_devices,
+    seed_all_communities_if_empty,
 )
 
 
@@ -124,6 +125,7 @@ st.markdown(
 def _init_state() -> None:
 
     init_db()
+    seed_all_communities_if_empty()
 
     if "report_entries" not in st.session_state:
 

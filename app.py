@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 
@@ -68,6 +69,36 @@ from database import (
 
 
 st.set_page_config(page_title="巡检上报", page_icon="📋", layout="wide")
+
+
+def _inject_chunk_reload_guard() -> None:
+    """部署后浏览器缓存旧 JS 块时自动刷新（修复 FileUploader/Checkbox 加载失败）。"""
+    components.html(
+        """
+        <script>
+        (function () {
+          const shouldReload = (msg) =>
+            msg && msg.includes("Failed to fetch dynamically imported module");
+          const reload = () => {
+            try { window.top.location.reload(); }
+            catch (e) { window.location.reload(); }
+          };
+          window.addEventListener("unhandledrejection", (event) => {
+            const msg = (event.reason && event.reason.message) || String(event.reason || "");
+            if (shouldReload(msg)) { event.preventDefault(); reload(); }
+          });
+          window.addEventListener("error", (event) => {
+            if (shouldReload(event.message || "")) { event.preventDefault(); reload(); }
+          });
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+_inject_chunk_reload_guard()
 
 
 
